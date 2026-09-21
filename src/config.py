@@ -2,7 +2,6 @@ from __future__ import annotations
 
 APP_NAME = "CineVora AI"
 APP_TAGLINE = "Understand your story. Improve your script."
-DEFAULT_MODEL = "CineVora Free Local Engine"
 MAX_SCRIPT_CHARS = 1_500_000
 MAX_SCENE_ANALYSIS = 12
 MAX_CHARACTERS = 8

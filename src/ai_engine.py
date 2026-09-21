@@ -11,11 +11,9 @@ from .config import MAX_CHARACTERS, MAX_SCENE_ANALYSIS
 
 
 # -----------------------------------------------------------------------------
-# CineVora Free Engine
+# CineVora Analysis Engine
 # -----------------------------------------------------------------------------
-# This module intentionally uses no paid API and sends no screenplay text to an
-# external service. It uses deterministic screenplay/NLP heuristics so it can
-# run on Streamlit Community Cloud for free (subject to Streamlit's own limits).
+# Deterministic screenplay/text-pattern heuristics for student-focused analysis.
 # -----------------------------------------------------------------------------
 
 SCENE_RE = re.compile(
@@ -27,6 +25,17 @@ META_RE = re.compile(r"^(TITLE|TYPE|GENRE|LANGUAGE|EPISODES?|WRITTEN BY|DURATION
 TRANSITION_WORDS = {
     "CUT TO:", "CUT TO BLACK.", "CUT TO BLACK", "FADE IN:", "FADE OUT:",
     "DISSOLVE TO:", "SMASH CUT:", "MATCH CUT:", "THE END", "END"
+}
+# Words that commonly appear in uppercase action/narration lines but are not
+# reliable character names. This prevents lines such as "THREE OF THEM)" or
+# "MONTAGE START" from becoming the detected protagonist.
+CUE_REJECT_TOKENS = {
+    "THEM", "THEY", "THEIR", "HE", "HIM", "HIS", "SHE", "HER", "HERS",
+    "EVERYONE", "EVERYBODY", "ALL", "BOTH", "THREE", "TWO", "ONE",
+    "GUY", "GUYS", "MAN", "WOMAN", "BOY", "GIRL", "PEOPLE",
+    "MONTAGE", "START", "FINISH", "TITLE", "CARD", "SFX", "BGM",
+    "CAMERA", "SHOT", "CLOSE", "WIDE", "ANGLE", "VOICE", "NARRATION",
+    "DISSOLVE", "FADE", "CUT"
 }
 STOPWORDS = {
     "the", "and", "that", "with", "from", "into", "this", "then", "they", "their",
@@ -120,19 +129,44 @@ def _is_character_cue(lines: list[str], idx: int) -> bool:
         return False
     if line.upper() in TRANSITION_WORDS or line.upper().startswith("END EPISODE"):
         return False
-    if len(line) > 55 or line.endswith(('.', '!', '?', ':')):
+    if len(line) > 70 or line.endswith(('.', '!', '?', ':')):
         return False
-    letters = [c for c in line if c.isalpha()]
-    if not letters or not all(c.isupper() for c in letters):
+    # Action/narration in brackets is never a speaker cue. Student scripts often
+    # use bracketed action, so this guard is important for beginner formatting.
+    if line.startswith(("(", "[", "{")):
         return False
-    # A cue normally has dialogue soon after it.
-    for j in range(idx + 1, min(idx + 4, len(lines))):
+
+    # Support non-standard student cues such as:
+    #   VIJAY (TALKING WITH SIVA)
+    # while validating only the actual name before the parenthetical.
+    base = line.split("(", 1)[0].strip()
+    base = re.sub(r"\s+", " ", base)
+    if not base or len(base) > 36 or len(base.split()) > 4:
+        return False
+    if not re.fullmatch(r"[A-Z][A-Z0-9 .&'\-]*", base):
+        return False
+    tokens = {t for t in re.findall(r"[A-Z]+", base)}
+    if not tokens or tokens & CUE_REJECT_TOKENS:
+        return False
+
+    # A cue normally has dialogue soon after it. A short parenthetical immediately
+    # after the cue is allowed; long action blocks are not.
+    saw_parenthetical = False
+    for j in range(idx + 1, min(idx + 5, len(lines))):
         nxt = lines[j].strip()
         if not nxt:
             continue
         if _is_scene_heading(nxt) or META_RE.match(nxt):
             return False
-        if nxt.upper() in TRANSITION_WORDS:
+        if nxt.upper() in TRANSITION_WORDS or nxt.upper().startswith("END EPISODE"):
+            return False
+        if _is_character_cue(lines, j):
+            return False
+        if nxt.startswith("(") and nxt.endswith(")") and len(nxt.split()) <= 8 and not saw_parenthetical:
+            saw_parenthetical = True
+            continue
+        # Dialogue should look like spoken text, not an obvious action-only label.
+        if re.fullmatch(r"[-–—_*#=]+", nxt):
             return False
         return True
     return False
@@ -254,17 +288,26 @@ def _detect_genre(text: str) -> tuple[str, list[str]]:
     return main, supporting
 
 
-def _infer_theme(text: str, genre: str) -> str:
+def _infer_theme(text: str, genre: str) -> tuple[str, str]:
+    """Return a cautious possible theme plus confidence label.
+
+    The engine should not invent a theme from one keyword. It only states a theme
+    confidently when several related signals appear in the supplied script.
+    """
     low = text.lower()
+    if any(x in low for x in ["zombie", "infected", "infection", "turned"]) and any(x in low for x in ["friend", "friends", "university", "college", "cafeteria"]):
+        return "Survival, friendship, and how people respond when a familiar place becomes dangerous.", "Medium"
     if ("dream" in low or "future" in low or "cinema" in low or "director" in low) and any(x in low for x in ["father", "mother", "parents", "family", "job"]):
-        return "Choosing a personal dream while facing family or social expectations."
-    if any(x in low for x in ["fear", "afraid", "scared", "running"]) and any(x in low for x in ["face", "confront", "stay"]):
-        return "Facing fear instead of allowing it to control your choices."
-    if "Romance" in genre or "love" in low:
-        return "Genuine connection grows through honesty and small human moments."
-    if any(x in low for x in ["friend", "friends", "friendship"]):
-        return "Friendship and support shape how the characters handle pressure and change."
-    return "The script explores how a character responds to conflict and change."
+        return "Choosing a personal dream while facing family or social expectations.", "High"
+    fear_signals = sum(low.count(x) for x in ["fear", "afraid", "scared", "running"])
+    face_signals = sum(low.count(x) for x in ["face it", "confront", "decides to stay", "chooses to stay"])
+    if fear_signals >= 2 and face_signals >= 1:
+        return "Facing fear instead of allowing it to control your choices.", "Medium"
+    if ("Romance" in genre or "love" in low) and any(x in low for x in ["honest", "genuine", "trust", "connection", "relationship", "smile", "laugh"]):
+        return "Genuine connection grows through honesty and small human moments.", "Medium"
+    if sum(low.count(x) for x in ["friend", "friends", "friendship", "support"]) >= 3:
+        return "Friendship and support shape how the characters handle pressure and change.", "Medium"
+    return "CineVora could not confidently identify one main theme from the screenplay alone.", "Low"
 
 
 def _infer_goal(main: str, dialogues: list[DialogueBlock], text: str, genre: str) -> str:
@@ -279,44 +322,151 @@ def _infer_goal(main: str, dialogues: list[DialogueBlock], text: str, genre: str
         return "Pursue a filmmaking or creative goal."
     if "Romance" in genre:
         return "Understand or build an important personal connection."
+    if any(x in low for x in ["zombie", "infected", "infection", "turned"]):
+        return "Understand the danger and survive the escalating threat."
     if "Horror" in genre or "Thriller" in genre:
         return "Understand the threat and get through the situation safely."
-    return "Move toward the central objective established by the screenplay."
+    return "The protagonist's specific goal was not stated clearly enough for CineVora to identify with confidence."
 
 
-def _infer_problem(text: str, genre: str) -> str:
+def _clean_story_line(line: str) -> str:
+    s = re.sub(r"\s+", " ", (line or "").strip())
+    if s.startswith("(") and s.endswith(")"):
+        s = s[1:-1].strip()
+    s = re.sub(r"^[\-*•]+\s*", "", s)
+    return _clip(s, 150)
+
+
+def _story_candidate_lines(lines: list[str]) -> list[tuple[int, str]]:
+    out: list[tuple[int, str]] = []
+    for i, raw in enumerate(lines):
+        s = raw.strip()
+        if not s or META_RE.match(s) or _is_scene_heading(s):
+            continue
+        if s.upper() in TRANSITION_WORDS or s.upper().startswith("END EPISODE"):
+            continue
+        if re.fullmatch(r"[-–—_*#=.:]+", s):
+            continue
+        if _is_character_cue(lines, i):
+            continue
+        cleaned = _clean_story_line(s)
+        if len(re.findall(r"\w+", cleaned)) < 3:
+            continue
+        # Skip obvious screenplay labels rather than treating them as story events.
+        if re.match(r"^(MONTAGE|TITLE CARD|SFX|BGM|CAMERA|SHOT)\b", cleaned, re.IGNORECASE):
+            continue
+        out.append((i, cleaned))
+    return out
+
+
+def _action_candidate_lines(lines: list[str]) -> list[tuple[int, str]]:
+    """Return likely action/narration lines, excluding dialogue and character cues.
+
+    This is used for summaries so spoken lines are not mistaken for plot events.
+    """
+    dialogue_indices: set[int] = set()
+    i = 0
+    while i < len(lines):
+        if not _is_character_cue(lines, i):
+            i += 1
+            continue
+        j = i + 1
+        saw_content = False
+        while j < len(lines):
+            raw = lines[j].strip()
+            if not raw:
+                if saw_content:
+                    break
+                j += 1
+                continue
+            if _is_scene_heading(raw) or META_RE.match(raw) or raw.upper() in TRANSITION_WORDS or raw.upper().startswith("END EPISODE"):
+                break
+            if _is_character_cue(lines, j):
+                break
+            dialogue_indices.add(j)
+            saw_content = True
+            j += 1
+        i = max(j, i + 1)
+
+    out: list[tuple[int, str]] = []
+    for idx, cleaned in _story_candidate_lines(lines):
+        if idx in dialogue_indices:
+            continue
+        out.append((idx, cleaned))
+    return out
+
+
+def _best_conflict_evidence(lines: list[str]) -> str:
+    candidates = _story_candidate_lines(lines)
+    for _, s in candidates:
+        low = s.lower()
+        if any(x in low for x in ["zombie", "infected", "infection", "locked", "lock", "blood", "attacks", "attack", "fight", "failed", "fail", "argument", "pressure", "can't", "cannot", "won't", "missing", "danger", "trapped", "shadow", "escape", "run", "door", "scream"]):
+            return s
+    for _, s in candidates:
+        if any(w in s.lower() for w in CONFLICT_WORDS):
+            return s
+    return ""
+
+
+def _infer_problem(text: str, genre: str, lines: list[str]) -> str:
     low = text.lower()
+    if any(x in low for x in ["zombie", "infected", "infection", "turned"]) and any(x in low for x in ["blood", "attack", "stuck", "danger", "auditorium"]):
+        return "A zombie-like transformation or infection creates a direct threat for the characters."
     if ("dream" in low or "future" in low or "cinema" in low) and any(x in low for x in ["father", "mother", "parents", "job"]):
         return "Personal ambition clashes with family expectations and pressure about the future."
-    if any(x in low for x in ["locked", "fear", "ghost", "haunted", "strange", "blood"]):
-        return "An unsettling threat or unexplained situation disrupts the protagonist's normal goal."
-    if "Romance" in genre:
+    if "Romance" in genre and any(x in low for x in ["love", "like", "crush", "relationship", "request"]):
         return "Uncertainty about feelings, trust, or communication complicates the relationship."
     if any(x in low for x in ["exam", "fail", "competition", "deadline"]):
         return "The protagonist faces pressure around an important test, deadline, or outcome."
-    return "The protagonist meets resistance that makes the central goal harder to achieve."
+    evidence = _best_conflict_evidence(lines)
+    if evidence:
+        return f"A clear obstacle or threat emerges around this moment: {evidence}"
+    return "CineVora could not confidently identify one central problem. Review the conflict manually or provide a clearer protagonist goal."
 
 
 def _last_story_line(lines: list[str]) -> str:
-    for line in reversed(lines):
-        s = line.strip()
-        if not s or META_RE.match(s) or s.upper() in TRANSITION_WORDS or _is_character_cue(lines, lines.index(line) if line in lines else 0):
-            continue
-        if s.upper().startswith("END EPISODE"):
-            return _clip(s.split(":", 1)[-1], 130)
-        return _clip(s, 130)
-    return "The ending should be reviewed for how clearly it resolves or extends the central conflict."
+    candidates = _story_candidate_lines(lines)
+    if not candidates:
+        return "The ending could not be identified confidently by CineVora."
+    # Prefer a meaningful line from the final quarter rather than a stray dash,
+    # transition, label, or malformed cue at the physical end of the file.
+    for _, s in reversed(candidates):
+        if len(s.split()) >= 4:
+            return s
+    return candidates[-1][1]
 
 
-def _build_summary(main: str, second: str, locations: list[str], genre: str, problem: str, outcome: str) -> str:
-    place = locations[0] if locations else "the story's main setting"
+def _build_summary(main: str, second: str, locations: list[str], genre: str, problem: str, outcome: str, lines: list[str], text: str) -> str:
+    """Build an evidence-led summary instead of a genre-template summary."""
+    place = locations[0] if locations else "the main setting"
+    candidates = _story_candidate_lines(lines)
+    if not candidates:
+        return f"{main}'s screenplay was loaded, but CineVora could not extract enough reliable story events to produce a trustworthy summary."
+
+    # Prefer action/narration for summary evidence so dialogue is not mistaken for plot.
+    action_candidates = _action_candidate_lines(lines)
+    evidence_candidates = action_candidates if len(action_candidates) >= 2 else candidates
+    early = evidence_candidates[0][1]
+    mid = evidence_candidates[len(evidence_candidates)//2][1]
+    low = text.lower()
+
+    if any(x in low for x in ["zombie", "infected", "infection", "turned"]):
+        companions = f" with {second}" if second else ""
+        locs = ", then ".join(locations[:2]) if locations else place
+        return (
+            f"{main}{companions} is introduced around {locs}. The script foreshadows danger through events such as {early}. "
+            f"{problem} As the situation develops, {mid}. The final detected story beat is: {outcome}"
+        )
     if "Romance" in genre:
         partner = second or "another character"
-        return f"{main} navigates a developing connection with {partner} around {place}. Their interactions build through small conversations and emotional uncertainty. {problem} The screenplay moves toward an ending that clarifies how the relationship has changed."
-    if "Horror" in genre or "Thriller" in genre or "Mystery" in genre:
-        return f"{main} enters or moves through {place} and encounters increasingly unsettling events. {problem} The tension escalates through visual details and reactions before the story reaches its final beat: {outcome}"
-    return f"{main} moves through a story centered on {place}. {problem} The screenplay develops this pressure through scenes, relationships, and choices before reaching its ending: {outcome}"
-
+        return (
+            f"{main} navigates a developing connection with {partner} around {place}. Early in the script, {early}. "
+            f"{problem} Later, {mid}. The final detected story beat is: {outcome}"
+        )
+    return (
+        f"{main} is introduced around {place}. Early in the screenplay, {early}. {problem} "
+        f"Later, {mid}. The final detected story beat is: {outcome}"
+    )
 
 def _structure_names(script_type: str) -> list[str]:
     if script_type == "Feature Film":
@@ -374,7 +524,7 @@ def _analyse_structure(script_type: str, scenes: list[Scene], lines: list[str]) 
     episodes = _episode_analysis(lines) if script_type == "Web Series" else []
     clear_count = sum(1 for b in beats if b["status"] in {"Clear", "Present"})
     overall = "Clear" if clear_count >= max(3, len(beats) - 1) else "Mostly Clear" if clear_count >= 3 else "Unclear"
-    summary = f"Free mode detected {clear_count} of {len(beats)} major structure beats with usable evidence. Review the weaker beats as learning guidance rather than a strict formula."
+    summary = f"CineVora detected {clear_count} of {len(beats)} major structure beats with usable evidence. Review the weaker beats as learning guidance rather than a strict formula."
     return {"overall_status": overall, "summary": summary, "beats": beats, "episodes": episodes}
 
 
@@ -388,7 +538,7 @@ def _episode_analysis(lines: list[str]) -> list[dict[str, str]]:
         narrative = [x for x in chunk if not META_RE.match(x) and not _is_scene_heading(x) and not x.upper() in TRANSITION_WORDS]
         opening = _clip(next((x for x in narrative if not x.upper().startswith("END EPISODE")), headings[0] if headings else "Opening not clear"), 130)
         middle = _clip(narrative[len(narrative) // 2] if narrative else "Main event not clear", 130)
-        conflict = _clip(next((x for x in narrative if any(w in x.lower() for w in CONFLICT_WORDS)), "Conflict is not strongly signposted in free mode."), 130)
+        conflict = _clip(next((x for x in narrative if any(w in x.lower() for w in CONFLICT_WORDS)), "Conflict is not strongly signposted in the screenplay."), 130)
         ending = next((x.split(":", 1)[-1].strip() for x in reversed(chunk) if x.upper().startswith("END EPISODE")), "Ending hook not explicitly labelled.")
         out.append({
             "episode": label,
@@ -428,7 +578,7 @@ def _analyse_characters(char_counts: Counter, dialogues: list[DialogueBlock], li
         elif any(w in (own + " " + context).lower() for w in ["love", "like", "feel", "relationship"]):
             motivation = "Personal feelings and relationship uncertainty appear to motivate this character."
 
-        conflict = problem if name == main else "This character is involved in or reacts to the central conflict, though free mode may not infer a separate internal conflict reliably."
+        conflict = problem if name == main else "This character is involved in or reacts to the central conflict, though CineVora may not infer a separate internal conflict reliably."
         strength = "Has a clear presence in the screenplay and contributes to the scene dynamics." if count >= 2 else "Has an identifiable function in the scenes where they appear."
         weakness = "The character may need more distinctive choices or reactions to feel fully developed." if count < 3 else "Check whether the character's dialogue and choices remain distinct from other characters."
         occurrences = [d.line_index for d in by_char.get(name, [])]
@@ -495,13 +645,13 @@ def _analyse_dialogue(dialogues: list[DialogueBlock]) -> tuple[dict[str, Any], d
         d = expo_blocks[0]
         findings.append({"category": "Too Much Exposition", "status": "Needs Attention", "example": _clip(d.text, 135), "problem": "Some dialogue combines explanation with a relatively long speech.", "why_it_matters": "When characters explain information directly, the scene can feel written for the audience rather than lived by the characters.", "suggestion": "Move part of the information into behaviour, conflict, visual detail, or a later shorter line."})
     else:
-        findings.append({"category": "Too Much Exposition", "status": "Good", "example": "", "problem": "No strong exposition-heavy pattern was detected by the free engine.", "why_it_matters": "This suggests information is not consistently delivered in long explanatory speeches.", "suggestion": "Still review any backstory-heavy scenes manually; heuristic detection can miss subtle exposition."})
+        findings.append({"category": "Too Much Exposition", "status": "Good", "example": "", "problem": "No strong exposition-heavy pattern was detected by CineVora.", "why_it_matters": "This suggests information is not consistently delivered in long explanatory speeches.", "suggestion": "Still review any backstory-heavy scenes manually; heuristic detection can miss subtle exposition."})
 
     if repeated_blocks:
         d = repeated_blocks[0]
         findings.append({"category": "Repetitive", "status": "Needs Attention", "example": _clip(d.text, 120), "problem": "The same or very similar dialogue appears more than once.", "why_it_matters": "Repeated information can make a scene feel longer without adding new conflict or emotion.", "suggestion": "Keep the strongest version and make later lines add new information, escalation, or subtext."})
     else:
-        findings.append({"category": "Repetitive", "status": "Good", "example": "", "problem": "No exact repeated dialogue pattern was detected.", "why_it_matters": "Each exchange is more likely to move the scene forward.", "suggestion": "Free mode checks obvious repetition; also review repeated ideas expressed with different wording."})
+        findings.append({"category": "Repetitive", "status": "Good", "example": "", "problem": "No exact repeated dialogue pattern was detected.", "why_it_matters": "Each exchange is more likely to move the scene forward.", "suggestion": "CineVora checks obvious repetition; also review repeated ideas expressed with different wording."})
 
     findings.append({
         "category": "Character Voice", "status": "Good" if voice_distinct else "Needs Attention",
@@ -586,7 +736,7 @@ def _analyse_scenes(scenes: list[Scene], dialogues: list[DialogueBlock]) -> list
         what_works = "The scene has a clear heading and contains visible action or reaction." if _is_scene_heading(scene.heading) else "The scene contains a readable story event even though standard formatting is limited."
         if chars:
             what_works += f" It gives {', '.join(chars[:3])} an active presence."
-        problem = "No major pacing problem detected in this scene by the free engine."
+        problem = "No major pacing problem was detected in this scene."
         suggestion = "Keep the scene focused on one meaningful change in information, emotion, conflict, or direction."
         if scene.words > median_words * 1.8 and scene.words > 130:
             problem = "This scene is much longer than the script's typical scene length."
@@ -640,7 +790,7 @@ def _segment_pacing(scenes: list[Scene], dialogue_metrics: dict[str, float]) -> 
         "ending": quarter_label(0.88, 1.0),
         "slow_sections": [f"Scene {s.number}: {s.heading} ({s.words} words)" for s in slow[:5]],
         "rushed_sections": [f"Scene {s.number}: {s.heading} ({s.words} words)" for s in rushed[:5]],
-        "explanation": f"Free mode compares scene lengths and dialogue density inside this screenplay. Typical scene length is about {median:.0f} words; this is a relative pacing signal, not a timing measurement.",
+        "explanation": f"CineVora compares scene lengths and dialogue density inside this screenplay. Typical scene length is about {median:.0f} words; this is a relative pacing signal, not a timing measurement.",
     }
 
 
@@ -680,7 +830,7 @@ def _analyse_originality(text: str, genre: str, locations: list[str], main: str)
         distinctive.append(f"The execution is anchored around {main}'s specific choices and reactions rather than premise alone.")
     return {
         "score": score,
-        "explanation": "Free mode estimates distinctiveness only from patterns inside the uploaded screenplay. It does not search the internet or compare against a database, so this is not a plagiarism or 'never done before' score.",
+        "explanation": "CineVora estimates distinctiveness only from patterns inside the uploaded screenplay. It does not search the internet or compare against a database, so this is not a plagiarism or 'never done before' score.",
         "familiar_elements": familiar[:3],
         "distinctive_elements": distinctive[:3],
     }
@@ -832,13 +982,13 @@ def _strengths_weaknesses(scores: dict[str, int], format_data: dict[str, Any], s
     ranked = sorted(((v, k) for k, v in scores.items() if k != "overall"), reverse=True)
     strengths = []
     for v, k in ranked[:3]:
-        strengths.append({"title": category_names[k], "explanation": f"Free-mode indicators place this area at {v}/100, making it one of the script's stronger current areas."})
+        strengths.append({"title": category_names[k], "explanation": f"Current analysis indicators place this area at {v}/100, making it one of the script's stronger current areas."})
     if show_tell.get("strong_visual_moments"):
         strengths.append({"title": "Visual storytelling", "explanation": "The script contains physical actions or reactions that communicate story information visually."})
 
     weaknesses = []
     for v, k in sorted((v, k) for k, v in scores.items() if k != "overall")[:3]:
-        weaknesses.append({"title": category_names[k], "explanation": f"At {v}/100, this area contains the clearest opportunities for revision according to the free engine's internal checks."})
+        weaknesses.append({"title": category_names[k], "explanation": f"At {v}/100, this area contains the clearest opportunities for revision according to the analysis checks."})
     if dialogue.get("overall_status") == "Needs Attention":
         weaknesses.append({"title": "Dialogue efficiency", "explanation": "Long, explanatory, or repetitive dialogue patterns may be slowing some scenes."})
 
@@ -864,11 +1014,10 @@ def _strengths_weaknesses(scores: dict[str, int], format_data: dict[str, Any], s
 def analyse_script(
     script_text: str,
     *,
-    api_key: str = "",
-    model: str = "Free Local Engine",
     script_type_hint: str = "Auto Detect",
     language_hint: str = "Auto Detect",
     title_hint: str = "",
+    main_character_hint: str = "",
     page_count: int | None = None,
 ) -> dict[str, Any]:
     """Analyse a screenplay without any paid API or external network call."""
@@ -886,12 +1035,15 @@ def analyse_script(
     genre, supporting_genres = _detect_genre(text)
     language = _detect_language(text, language_hint)
     title = title_hint.strip() or _meta_value(text, "TITLE") or "Untitled Screenplay"
-    main = characters[0] if characters else "Main Character"
-    second = characters[1] if len(characters) > 1 else ""
-    problem = _infer_problem(text, genre)
+    auto_main = characters[0] if characters else "Main Character"
+    main = main_character_hint.strip() or auto_main
+    # If the user supplies a protagonist hint, keep it visible even when non-standard
+    # formatting prevented automatic detection of their dialogue cue.
+    second = next((c for c in characters if c != main), "")
+    problem = _infer_problem(text, genre, lines)
     goal = _infer_goal(main, dialogues, text, genre)
     outcome = _last_story_line(lines)
-    theme = _infer_theme(text, genre)
+    theme, theme_confidence = _infer_theme(text, genre)
     word_count = len(re.findall(r"\b\w+[’']?\w*\b", text))
     estimated_minutes = max(1, round(word_count / 150))
     explicit_eps = _meta_value(text, "EPISODES")
@@ -914,9 +1066,11 @@ def analyse_script(
         "episode_count": ep_count,
         "characters": characters,
         "locations": locations,
-        "summary": _build_summary(main, second, locations, genre, problem, outcome),
+        "summary": _build_summary(main, second, locations, genre, problem, outcome, lines, text),
         "theme": theme,
+        "theme_confidence": theme_confidence,
         "main_character": main,
+        "main_character_auto_detected": auto_main,
         "goal": goal,
         "main_problem": problem,
         "outcome": outcome,
@@ -959,14 +1113,13 @@ def analyse_script(
         "improvement_suggestions": improvements,
         "scores": scores,
         "final_feedback": {
-            "summary": f"CineVora Free analysed this screenplay locally with rule-based screenplay heuristics. The current creative guidance score is {scores['overall']}/100. Use the lowest-scoring areas and flagged scenes as revision priorities, not as academic grades.",
+            "summary": f"CineVora analysed this screenplay using screenplay heuristics and text-pattern checks. The current creative guidance score is {scores['overall']}/100. Use the lowest-scoring areas and flagged scenes as revision priorities, not as academic grades.",
             "top_improvements": [x["how_to_improve"] for x in improvements[:3]],
             "next_steps": next_steps[:3],
         },
         "analysis_meta": {
-            "model": "CineVora Free Local Engine",
-            "coverage_note": "Full supplied text analysed locally. No API key, paid credits, or external model call used.",
-            "privacy_note": "The analysis engine does not send screenplay text to OpenAI or another external AI API.",
+            "engine": "CineVora Analysis Engine",
+            "coverage_note": "The supplied screenplay text was processed for this analysis.",
         },
     }
     return _normalise_scores(data)

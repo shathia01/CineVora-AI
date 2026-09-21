@@ -3,8 +3,8 @@ from __future__ import annotations
 APP_NAME = "CineVora AI"
 APP_TAGLINE = "Understand your story. Improve your script."
 MAX_SCRIPT_CHARS = 1_500_000
-MAX_SCENE_ANALYSIS = 12
-MAX_CHARACTERS = 8
+MAX_SCENE_ANALYSIS = 18
+MAX_CHARACTERS = 10
 
 SCRIPT_TYPES = ["Auto Detect", "Short Film", "Feature Film", "Web Series", "Pilot"]
 LANGUAGES = ["Auto Detect", "English", "Tamil", "Tanglish", "Bahasa Malaysia", "Other"]

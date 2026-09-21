@@ -6,7 +6,7 @@ from pathlib import Path
 import streamlit as st
 
 from src.ai_engine import analyse_script
-from src.config import APP_NAME, DEFAULT_MODEL, LANGUAGES, LEARNING_TOPICS, SCRIPT_TYPES
+from src.config import APP_NAME, LANGUAGES, LEARNING_TOPICS, SCRIPT_TYPES
 from src.parser import parse_uploaded_file, read_sample
 from src.report import build_pdf_report
 from src.ui import chips, download_json, inject_global_css, learn_expander, render_brand_header, render_intro, status_icon
@@ -55,7 +55,7 @@ def home_page():
     left, right = st.columns([1.2, .8], gap="large")
     with left:
         st.markdown("### Understand → Analyse → Learn → Improve")
-        st.write("CineVora AI gives screenplay feedback without taking over the student's creative decisions. This Free Edition runs without OpenAI credits or an API key and separates storytelling quality from screenplay formatting so beginners are taught rather than punished.")
+        st.write("CineVora AI gives screenplay feedback without taking over the student's creative decisions. It separates storytelling quality from screenplay formatting so beginners can learn without being unfairly penalised.")
         st.markdown("""
         <div class='cv-card'><b>Story Intelligence</b><br><span class='cv-muted'>Overview, genre, adaptive structure, characters, scenes, pacing, dialogue, originality and show-vs-tell.</span></div>
         <div class='cv-card'><b>Student Learning Mode</b><br><span class='cv-muted'>Short “Why?” explanations for screenplay concepts with examples and quick tips.</span></div>
@@ -67,7 +67,7 @@ def home_page():
             "Script Type + Overview", "Story / Series Structure", "Character Development", "Dialogue", "Important Scenes", "Pacing", "Originality", "Show vs Tell", "Screenplay Format", "Strengths & Weaknesses", "Overall Creative Score", "Final Feedback + Next Steps"
         ]:
             st.markdown(f"✓ {text}")
-        st.info("🆓 Free Edition: no API key required. Screenplay Format is separate from the Overall Script Score, so beginners are not punished for learning professional formatting.")
+        st.info("Screenplay Format is separate from the Overall Script Score, so beginners are not penalised while learning professional formatting.")
 
 
 def analyse_page():
@@ -117,15 +117,19 @@ def analyse_page():
         with c3:
             language = st.selectbox("Language", LANGUAGES)
 
-        st.success("🆓 Free Mode — No OpenAI API key, credits, or paid account required.")
-        with st.expander("How Free Mode works"):
-            st.write("CineVora Free analyses the screenplay locally with deterministic screenplay and text-pattern checks. Your screenplay is not sent to OpenAI or another paid AI API.")
-            st.caption("Free Mode is useful for university learning and demos, but its feedback is less nuanced than a large language model. Treat scores as guidance, not academic grades.")
+        main_character_hint = st.text_input(
+            "Main character / protagonist (optional)",
+            value="",
+            help="Leave blank for auto-detection. Entering the protagonist name can improve accuracy for non-standard student screenplay formatting.",
+        )
 
-        model = DEFAULT_MODEL
+        with st.expander("How CineVora analysis works"):
+            st.write("CineVora analyses the screenplay using its built-in screenplay and text-pattern analysis engine.")
+            st.caption("Treat scores as learning guidance, not academic grades. Story meaning, theme and originality feedback are approximate and should be reviewed by the writer.")
+
         st.caption(f"Loaded source: {st.session_state.source_name or 'Script'} • {len(st.session_state.script_text):,} characters")
 
-        if st.button("🎬 Analyse Script — FREE", type="primary", use_container_width=True):
+        if st.button("🎬 Analyse Script", type="primary", use_container_width=True):
             with st.status("CineVora is reading your screenplay…", expanded=True) as status:
                 try:
                     st.write("Detecting script type, genre, characters and scenes…")
@@ -133,10 +137,10 @@ def analyse_page():
                     st.write("Preparing student-friendly feedback and next steps…")
                     result = analyse_script(
                         st.session_state.script_text,
-                        model=model,
                         script_type_hint=script_type,
                         language_hint=language,
                         title_hint=title_hint,
+                        main_character_hint=main_character_hint,
                         page_count=st.session_state.source_pages,
                     )
                     st.session_state.analysis = result
@@ -177,11 +181,16 @@ def render_results(data):
         st.markdown(chips([ov.get("script_type", ""), ov.get("genre", ""), *ov.get("supporting_genres", []), ov.get("language", "")]), unsafe_allow_html=True)
         st.markdown("#### Story Summary")
         st.write(ov.get("summary", ""))
-        st.markdown("#### Main Theme")
+        st.markdown("#### Possible Main Theme")
         st.write(ov.get("theme", ""))
+        if ov.get("theme_confidence"):
+            st.caption(f"Theme confidence: {ov.get('theme_confidence')}. Theme detection is guidance, not a definitive interpretation.")
         st.markdown("#### Story at a glance")
         a, b = st.columns(2)
         a.markdown(f"**Main Character:** {ov.get('main_character', '—')}  \n**Goal:** {ov.get('goal', '—')}")
+        auto_main = ov.get("main_character_auto_detected")
+        if auto_main and auto_main != ov.get("main_character"):
+            a.caption(f"Auto-detected candidate: {auto_main}. Your manual protagonist setting was used instead.")
         b.markdown(f"**Main Problem:** {ov.get('main_problem', '—')}  \n**Outcome:** {ov.get('outcome', '—')}")
         st.markdown("#### Locations")
         st.markdown(chips(ov.get("locations", [])), unsafe_allow_html=True)
@@ -350,9 +359,9 @@ def learn_page():
 
 def about_page():
     st.markdown("## About CineVora AI")
-    st.write("CineVora AI Free is a screenplay analysis and learning assistant for university students and emerging filmmakers. This edition runs without OpenAI credits or an API key. Its purpose is to help writers understand their own work, not replace their creative decisions.")
-    st.markdown("### Free analysis engine")
-    st.write("The free edition uses local screenplay heuristics and text-pattern analysis. It does not send scripts to OpenAI or another paid AI API. Because it is not a large language model, some character, theme, originality, and story-meaning feedback will be less nuanced than the paid AI version.")
+    st.write("CineVora AI is a screenplay analysis and learning assistant for university students and emerging filmmakers. Its purpose is to help writers understand their own work, not replace their creative decisions.")
+    st.markdown("### Analysis engine")
+    st.write("CineVora uses screenplay heuristics and text-pattern analysis designed for student learning. Character, theme, originality and story-meaning feedback should be treated as guidance and reviewed by the writer.")
     st.markdown("### Core rule")
     st.markdown("**Analyse → Explain → Teach → Suggest → Student decides.**")
     st.markdown("### Score fairness")

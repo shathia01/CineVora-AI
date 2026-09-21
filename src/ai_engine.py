@@ -288,46 +288,195 @@ def _detect_genre(text: str) -> tuple[str, list[str]]:
     return main, supporting
 
 
-def _infer_theme(text: str, genre: str) -> tuple[str, str]:
-    """Return a cautious possible theme plus confidence label.
+def _content_lines_without_metadata(text: str) -> list[str]:
+    """Return story content lines while removing metadata and structural labels.
 
-    The engine should not invent a theme from one keyword. It only states a theme
-    confidently when several related signals appear in the supplied script.
+    This prevents values such as ``TYPE: SHORT FILM`` or ``EPISODE 1`` from
+    accidentally influencing character goals, themes, and summaries.
     """
+    out: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if META_RE.match(line) or EPISODE_RE.match(line):
+            continue
+        if line.upper().startswith(("ACT ", "SCENE ", "CHAPTER ")):
+            continue
+        out.append(line)
+    return out
+
+
+def _explicit_danger_signals(text: str) -> bool:
     low = text.lower()
-    if any(x in low for x in ["zombie", "infected", "infection", "turned"]) and any(x in low for x in ["friend", "friends", "university", "college", "cafeteria"]):
+    explicit = [
+        "zombie", "infected", "infection", "virus", "bitten", "monster",
+        "ghost", "corpse", "blood", "attacks", "attack", "trapped",
+        "locked inside", "cannot escape", "can't escape", "scream"
+    ]
+    return any(x in low for x in explicit)
+
+
+def _event_score(sentence: str) -> float:
+    """Score an extracted screenplay line for story importance.
+
+    The score deliberately rewards change, conflict, discovery and decisive
+    action rather than generic setting words such as ``door`` or ``room``.
+    """
+    low = sentence.lower()
+    score = 0.0
+    high = [
+        "reveals", "discovers", "finds out", "confesses", "decides", "chooses",
+        "attacks", "dies", "death", "breaks", "escapes", "trapped", "locked",
+        "infected", "zombie", "fight", "confront", "rejects", "leaves home",
+        "wins", "loses", "fails", "missing", "truth", "secret"
+    ]
+    medium = [
+        "finds", "realises", "realizes", "turns toward", "closes", "opens",
+        "runs", "cries", "argues", "refuses", "accepts", "admits", "returns",
+        "calls", "follows", "changes", "threat", "danger", "pressure"
+    ]
+    score += sum(3.0 for w in high if w in low)
+    score += sum(1.5 for w in medium if w in low)
+    # Visually active lines are usually more useful than static description.
+    score += min(2.0, sum(1 for v in VISUAL_VERBS if re.search(rf"\b{re.escape(v)}\b", low)) * 0.4)
+    words = len(re.findall(r"\w+", sentence))
+    if 6 <= words <= 32:
+        score += 1.0
+    elif words > 55:
+        score -= 0.8
+    return score
+
+
+def _dedupe_events(events: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for event in events:
+        clean = _clean_story_line(event).strip(" .")
+        key = re.sub(r"[^a-z0-9]+", " ", clean.lower()).strip()
+        if not key or key in seen:
+            continue
+        # Avoid near-duplicates based on substantial word overlap.
+        words = set(key.split())
+        duplicate = False
+        for prev in out:
+            pwords = set(re.sub(r"[^a-z0-9]+", " ", prev.lower()).split())
+            if words and pwords and len(words & pwords) / max(1, min(len(words), len(pwords))) >= 0.75:
+                duplicate = True
+                break
+        if not duplicate:
+            out.append(clean)
+            seen.add(key)
+    return out
+
+
+def _representative_story_events(lines: list[str], max_events: int = 5) -> list[str]:
+    """Choose representative action beats across the whole screenplay.
+
+    Instead of blindly taking the first, middle and final line, sample the story
+    across its timeline and prefer lines that contain meaningful change.
+    """
+    candidates = _action_candidate_lines(lines)
+    if len(candidates) < 3:
+        candidates = _story_candidate_lines(lines)
+    if not candidates:
+        return []
+
+    n = len(candidates)
+    buckets = min(max_events, n)
+    chosen: list[str] = []
+    for b in range(buckets):
+        start = round(b * n / buckets)
+        end = max(start + 1, round((b + 1) * n / buckets))
+        segment = candidates[start:end]
+        if not segment:
+            continue
+        # Beginning favours the earliest usable setup; later buckets favour
+        # the strongest dramatic event while still representing chronology.
+        if b == 0:
+            best = segment[0][1]
+        elif b == buckets - 1:
+            late = sorted(segment, key=lambda x: (_event_score(x[1]), x[0]), reverse=True)
+            best = late[0][1]
+        else:
+            best = max(segment, key=lambda x: _event_score(x[1]))[1]
+        chosen.append(best)
+    return _dedupe_events(chosen)[:max_events]
+
+
+def _infer_theme(text: str, genre: str) -> tuple[str, str]:
+    """Return a cautious possible theme plus confidence label."""
+    content = "\n".join(_content_lines_without_metadata(text))
+    low = content.lower()
+
+    # Require explicit transformation/infection language. The old engine used
+    # the ordinary verb "turned", which caused false zombie themes in lines like
+    # "he turned their memories into scenes".
+    zombie_signals = any(x in low for x in ["zombie", "infected", "infection", "virus", "bitten"])
+    if zombie_signals and any(x in low for x in ["friend", "friends", "university", "college", "cafeteria", "school"]):
         return "Survival, friendship, and how people respond when a familiar place becomes dangerous.", "Medium"
-    if ("dream" in low or "future" in low or "cinema" in low or "director" in low) and any(x in low for x in ["father", "mother", "parents", "family", "job"]):
+
+    creative_dream = any(x in low for x in ["become a director", "want to direct", "dream is to direct", "cinema is my future", "make my film", "make a film"])
+    family_pressure = any(x in low for x in ["father", "mother", "parents", "family", "job", "career"])
+    if creative_dream and family_pressure:
         return "Choosing a personal dream while facing family or social expectations.", "High"
-    fear_signals = sum(low.count(x) for x in ["fear", "afraid", "scared", "running"])
-    face_signals = sum(low.count(x) for x in ["face it", "confront", "decides to stay", "chooses to stay"])
+
+    fear_signals = sum(low.count(x) for x in ["fear", "afraid", "scared", "terrified"])
+    face_signals = sum(low.count(x) for x in ["face it", "confront", "chooses to stay", "decides to stay", "stops running"])
     if fear_signals >= 2 and face_signals >= 1:
         return "Facing fear instead of allowing it to control your choices.", "Medium"
+
     if ("Romance" in genre or "love" in low) and any(x in low for x in ["honest", "genuine", "trust", "connection", "relationship", "smile", "laugh"]):
         return "Genuine connection grows through honesty and small human moments.", "Medium"
+
     if sum(low.count(x) for x in ["friend", "friends", "friendship", "support"]) >= 3:
         return "Friendship and support shape how the characters handle pressure and change.", "Medium"
-    return "CineVora could not confidently identify one main theme from the screenplay alone.", "Low"
 
+    return "CineVora could not confidently identify one main theme from the screenplay alone.", "Low"
 
 def _infer_goal(main: str, dialogues: list[DialogueBlock], text: str, genre: str) -> str:
     candidates = [d for d in dialogues if d.character == main]
+    # Prefer an explicit first-person objective spoken by the protagonist.
+    goal_patterns = [
+        r"\bI want to\b(.{0,110})",
+        r"\bI need to\b(.{0,110})",
+        r"\bmy dream is(?: to)?\b(.{0,110})",
+        r"\bI'm going to\b(.{0,110})",
+        r"\bI am going to\b(.{0,110})",
+        r"\bI have to\b(.{0,110})",
+    ]
     for d in candidates:
-        m = re.search(r"\b(?:I want|I need|I'm going to|I am going to|my dream is|one day I(?:'m| am)?)\b(.{0,100})", d.text, re.IGNORECASE)
-        if m:
-            phrase = _clip((m.group(0)).strip(" ."), 120)
-            return phrase[0].upper() + phrase[1:] if phrase else "Pursue a clear personal objective."
-    low = text.lower()
-    if "director" in low or "cinema" in low or "film" in low:
+        for pat in goal_patterns:
+            m = re.search(pat, d.text, re.IGNORECASE)
+            if m:
+                phrase = _clip(m.group(0).strip(" ."), 125)
+                if phrase:
+                    return phrase[0].upper() + phrase[1:]
+
+    content = "\n".join(_content_lines_without_metadata(text))
+    low = content.lower()
+
+    # Only infer a filmmaking goal from actual aspiration language. Do not let
+    # metadata such as "TYPE: SHORT FILM" turn every short-film protagonist into
+    # an aspiring filmmaker.
+    creative_goal_phrases = [
+        "become a director", "want to be a director", "want to direct",
+        "dream is to direct", "cinema is my future", "make my own film",
+        "make a film", "pitch my film", "pitch the series"
+    ]
+    if any(x in low for x in creative_goal_phrases):
         return "Pursue a filmmaking or creative goal."
+
     if "Romance" in genre:
         return "Understand or build an important personal connection."
-    if any(x in low for x in ["zombie", "infected", "infection", "turned"]):
-        return "Understand the danger and survive the escalating threat."
-    if "Horror" in genre or "Thriller" in genre:
-        return "Understand the threat and get through the situation safely."
-    return "The protagonist's specific goal was not stated clearly enough for CineVora to identify with confidence."
 
+    if any(x in low for x in ["zombie", "infected", "infection", "virus", "bitten"]):
+        return "Understand the danger and survive the escalating threat."
+
+    if ("Horror" in genre or "Thriller" in genre) and _explicit_danger_signals(content):
+        return "Understand the threat and get through the situation safely."
+
+    return "The protagonist's specific goal was not stated clearly enough for CineVora to identify with confidence."
 
 def _clean_story_line(line: str) -> str:
     s = re.sub(r"\s+", " ", (line or "").strip())
@@ -341,7 +490,9 @@ def _story_candidate_lines(lines: list[str]) -> list[tuple[int, str]]:
     out: list[tuple[int, str]] = []
     for i, raw in enumerate(lines):
         s = raw.strip()
-        if not s or META_RE.match(s) or _is_scene_heading(s):
+        if not s or META_RE.match(s) or EPISODE_RE.match(s) or _is_scene_heading(s):
+            continue
+        if s.upper().startswith(("ACT ", "SCENE ", "CHAPTER ")):
             continue
         if s.upper() in TRANSITION_WORDS or s.upper().startswith("END EPISODE"):
             continue
@@ -397,76 +548,104 @@ def _action_candidate_lines(lines: list[str]) -> list[tuple[int, str]]:
 
 
 def _best_conflict_evidence(lines: list[str]) -> str:
-    candidates = _story_candidate_lines(lines)
-    for _, s in candidates:
-        low = s.lower()
-        if any(x in low for x in ["zombie", "infected", "infection", "locked", "lock", "blood", "attacks", "attack", "fight", "failed", "fail", "argument", "pressure", "can't", "cannot", "won't", "missing", "danger", "trapped", "shadow", "escape", "run", "door", "scream"]):
-            return s
-    for _, s in candidates:
-        if any(w in s.lower() for w in CONFLICT_WORDS):
-            return s
-    return ""
+    # Prefer action/narration, but fall back to all story candidates when the
+    # conflict is mainly expressed in dialogue.
+    candidates = _action_candidate_lines(lines)
+    if not candidates:
+        candidates = _story_candidate_lines(lines)
+    best: tuple[float, int, str] | None = None
+    high = [
+        "zombie", "infected", "infection", "locked", "trapped", "blood",
+        "attacks", "attack", "fight", "failed", "fails", "argument", "pressure",
+        "cannot", "can't", "won't", "missing", "danger", "escape", "scream",
+        "threat", "rejects", "refuses"
+    ]
+    medium = ["fear", "afraid", "secret", "truth", "runs", "run", "cry", "leaves"]
+    for idx, sentence in candidates:
+        low = sentence.lower()
+        score = sum(3 for w in high if w in low) + sum(1 for w in medium if w in low)
+        # A plain mention of a door/room is not conflict. Door only matters when
+        # paired with a change in access/control.
+        if "door" in low and any(x in low for x in ["locked", "won't open", "cannot open", "closes", "slams"]):
+            score += 2
+        score += _event_score(sentence) * 0.35
+        if score <= 0:
+            continue
+        item = (score, -idx, sentence)
+        if best is None or item > best:
+            best = item
+    return best[2] if best else ""
 
 
 def _infer_problem(text: str, genre: str, lines: list[str]) -> str:
-    low = text.lower()
-    if any(x in low for x in ["zombie", "infected", "infection", "turned"]) and any(x in low for x in ["blood", "attack", "stuck", "danger", "auditorium"]):
-        return "A zombie-like transformation or infection creates a direct threat for the characters."
-    if ("dream" in low or "future" in low or "cinema" in low) and any(x in low for x in ["father", "mother", "parents", "job"]):
+    content = "\n".join(_content_lines_without_metadata(text))
+    low = content.lower()
+    if any(x in low for x in ["zombie", "infected", "infection", "virus", "bitten"]) and any(x in low for x in ["blood", "attack", "stuck", "danger", "auditorium", "trapped", "escape"]):
+        return "A transformation or infection creates a direct physical threat for the characters."
+    if any(x in low for x in ["become a director", "want to direct", "cinema is my future", "dream is to direct"]) and any(x in low for x in ["father", "mother", "parents", "family", "job", "career"]):
         return "Personal ambition clashes with family expectations and pressure about the future."
-    if "Romance" in genre and any(x in low for x in ["love", "like", "crush", "relationship", "request"]):
+    if "Romance" in genre and any(x in low for x in ["love", "like", "crush", "relationship", "follow request", "feelings"]):
         return "Uncertainty about feelings, trust, or communication complicates the relationship."
-    if any(x in low for x in ["exam", "fail", "competition", "deadline"]):
+    if any(x in low for x in ["exam", "failed the exam", "competition", "deadline"]):
         return "The protagonist faces pressure around an important test, deadline, or outcome."
     evidence = _best_conflict_evidence(lines)
     if evidence:
-        return f"A clear obstacle or threat emerges around this moment: {evidence}"
-    return "CineVora could not confidently identify one central problem. Review the conflict manually or provide a clearer protagonist goal."
-
+        return f"The central obstacle becomes clear when {evidence.rstrip('.')} ."
+    return "CineVora could not confidently identify one central problem from the screenplay text alone."
 
 def _last_story_line(lines: list[str]) -> str:
-    candidates = _story_candidate_lines(lines)
+    # Prefer action/narration for the ending because a random final dialogue line
+    # can otherwise be mistaken for the outcome.
+    candidates = _action_candidate_lines(lines)
+    if not candidates:
+        candidates = _story_candidate_lines(lines)
     if not candidates:
         return "The ending could not be identified confidently by CineVora."
-    # Prefer a meaningful line from the final quarter rather than a stray dash,
-    # transition, label, or malformed cue at the physical end of the file.
-    for _, s in reversed(candidates):
+    final_quarter = candidates[max(0, int(len(candidates) * 0.75)):]
+    for _, s in reversed(final_quarter or candidates):
         if len(s.split()) >= 4:
-            return s
-    return candidates[-1][1]
+            return s.rstrip(" .") + "."
+    return candidates[-1][1].rstrip(" .") + "."
 
 
 def _build_summary(main: str, second: str, locations: list[str], genre: str, problem: str, outcome: str, lines: list[str], text: str) -> str:
-    """Build an evidence-led summary instead of a genre-template summary."""
+    """Build a fuller evidence-led short summary from representative story beats."""
     place = locations[0] if locations else "the main setting"
-    candidates = _story_candidate_lines(lines)
-    if not candidates:
-        return f"{main}'s screenplay was loaded, but CineVora could not extract enough reliable story events to produce a trustworthy summary."
+    events = _representative_story_events(lines, max_events=5)
+    if not events:
+        return f"CineVora loaded the screenplay, but it could not extract enough reliable story events to produce a trustworthy summary."
 
-    # Prefer action/narration for summary evidence so dialogue is not mistaken for plot.
-    action_candidates = _action_candidate_lines(lines)
-    evidence_candidates = action_candidates if len(action_candidates) >= 2 else candidates
-    early = evidence_candidates[0][1]
-    mid = evidence_candidates[len(evidence_candidates)//2][1]
-    low = text.lower()
+    # Remove events already substantially repeated by the problem/outcome.
+    filtered: list[str] = []
+    anchors = [problem.lower(), outcome.lower()]
+    for e in events:
+        el = e.lower()
+        if any(len(set(el.split()) & set(a.split())) / max(1, min(len(el.split()), len(a.split()))) > 0.78 for a in anchors if a):
+            continue
+        filtered.append(e)
+    events = filtered or events
 
-    if any(x in low for x in ["zombie", "infected", "infection", "turned"]):
-        companions = f" with {second}" if second else ""
-        locs = ", then ".join(locations[:2]) if locations else place
-        return (
-            f"{main}{companions} is introduced around {locs}. The script foreshadows danger through events such as {early}. "
-            f"{problem} As the situation develops, {mid}. The final detected story beat is: {outcome}"
-        )
-    if "Romance" in genre:
-        partner = second or "another character"
-        return (
-            f"{main} navigates a developing connection with {partner} around {place}. Early in the script, {early}. "
-            f"{problem} Later, {mid}. The final detected story beat is: {outcome}"
-        )
-    return (
-        f"{main} is introduced around {place}. Early in the screenplay, {early}. {problem} "
-        f"Later, {mid}. The final detected story beat is: {outcome}"
-    )
+    sentences: list[str] = []
+    intro = f"{main} is introduced in {place}"
+    if second:
+        intro += f" alongside {second}"
+    intro += f", where {events[0].rstrip('.')} ."
+    sentences.append(intro.replace("  ", " "))
+
+    # Add chronological middle beats for a more informative 4–6 sentence summary.
+    middle_events = events[1:4]
+    connectors = ["As the story develops", "Later", "As the situation changes"]
+    for i, event in enumerate(middle_events):
+        sentences.append(f"{connectors[min(i, len(connectors)-1)]}, {event.rstrip('.')} .")
+
+    if problem and "could not confidently" not in problem.lower():
+        sentences.append(problem.rstrip(" .") + ".")
+    if outcome:
+        sentences.append(f"By the ending, {outcome.rstrip('.')}.")
+
+    # Keep the short summary informative but readable.
+    deduped = _dedupe_events(sentences)
+    return " ".join(deduped[:6])
 
 def _structure_names(script_type: str) -> list[str]:
     if script_type == "Feature Film":
